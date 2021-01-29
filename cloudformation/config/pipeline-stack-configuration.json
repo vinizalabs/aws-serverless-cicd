@@ -1,0 +1,10 @@
+{
+  "Parameters" : {
+    "AppName" : "Sample",
+    "Branch": "master",
+    "BuildImageName" : "aws/codebuild/amazonlinux2-x86_64-standard:3.0",
+    "Email" : "sample@email.com",
+    "PipelineStackConfig" : "cloudformation/config/pipeline-stack-configuration.json",
+    "PipelineTemplateFileName" : "cloudformation/templates/pipeline.yaml"
+  }
+}

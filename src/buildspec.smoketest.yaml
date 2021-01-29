@@ -1,0 +1,11 @@
+version: 0.2
+phases:
+  post_build:
+    commands:
+      - echo "Smoke tests"
+      - API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME} --query "Stacks[*].Outputs[?OutputKey=='SampleApiUrl'].OutputValue" --output text)
+      - RANDOM_STRING=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 40 ; echo '')
+      - curl -XPOST https://${API_ENDPOINT}/sample/${RANDOM_STRING} -d '{"data":"abc"}'
+      - TEST_DATA=$(curl -XGET https://${API_ENDPOINT}/sample/${RANDOM_STRING}|python -c "import sys, json; print(json.load(sys.stdin)['Item']['data'])")
+      - echo $TEST_DATA
+      - if [ "$TEST_DATA" = 'abc' ]; then echo smoke test SUCCESS; else echo smoke test FAILED; exit 10; fi

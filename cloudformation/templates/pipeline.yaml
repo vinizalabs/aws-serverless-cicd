@@ -1,0 +1,667 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  This project demonstrates how to use AWS DevOps services such as CodePipeline,
+  CodeCommit, CodeBuild, CloudFormation and Lambda to create a CI/CD pipeline
+  to orchestrate  the deployment of a serverless API.
+
+Parameters:
+
+  AppName:
+    Description: Application name, used for the repository
+    Type: String
+    Default: Sample
+  BuildImageName:
+    Description: Docker image for application build
+    Type: String
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+  Branch:
+    Description: Repository branch name
+    Type: String
+    Default: master
+  PipelineStackConfig:
+    Default: cloudformation/config/pipeline-stack-configuration.json
+    Description: The configuration file name for the pipeline stack
+    Type: String
+  PipelineTemplateFileName:
+    Default: cloudformation/templates/pipeline.yaml
+    Description: The file name of the pipeline template
+    Type: String
+  Email:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Pipeline Settings"
+        Parameters:
+          - AppName
+          - BuildImageName
+          - Branch
+          - PipelineTemplateFileName
+          - PipelineStackConfig
+          - Email
+
+Conditions:
+  IsProdStage: !Equals [ !Ref Branch, 'master' ]
+
+Resources:
+
+  SamBucket:
+    Type: AWS::S3::Bucket
+
+  SamBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SamBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub ${SamBucket.Arn}
+              - !Sub ${SamBucket.Arn}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub ${SamBucket.Arn}
+              - !Sub ${SamBucket.Arn}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+
+  CodePipelineSNSTopic:
+    Condition: IsProdStage
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+      DisplayName: !Sub ${AppName}-notifications-${AWS::Region}
+
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactStoreBucket'
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Ref AppName
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt [Repository, Name]
+                BranchName: 'master'
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: '1'
+        - Name: Pipeline
+          Actions:
+            - Name: CreateStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Sub ${AppName}-Pipeline
+                TemplateConfiguration: !Sub "SourceOutput::${PipelineStackConfig}"
+                TemplatePath: !Sub "SourceOutput::${PipelineTemplateFileName}"
+              RunOrder: '1'
+        - Name: Build
+          Actions:
+            - Name: Build
+              RunOrder: 1
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: DeployToDev
+          Actions:
+            - Name: CreateChangeSet
+              RunOrder: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                StackName:
+                  !If
+                    - IsProdStage
+                    - !Sub ${AppName}-dev
+                    - !Sub ${AppName}-dev-${Branch}
+                RoleArn: !GetAtt [CFNRole, Arn]
+                TemplatePath: BuildArtifact::sample-transformed.yaml
+                TemplateConfiguration: BuildArtifact::sample-configuration-dev.json
+            - Name: DeployChangeSet
+              RunOrder: 2
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: CAPABILITY_IAM
+                ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                StackName:
+                  !If
+                    - IsProdStage
+                    - !Sub ${AppName}-dev
+                    - !Sub ${AppName}-dev-${Branch}
+                RoleArn: !GetAtt [CFNRole, Arn]
+            - Name: SmokeTest
+              RunOrder: 4
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref SmokeTestDevProject
+        - Name: DeployToTest
+          Actions:
+            - Name: CreateChangeSet
+              RunOrder: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                StackName:
+                  !If
+                    - IsProdStage
+                    - !Sub ${AppName}-test
+                    - !Sub ${AppName}-test-${Branch}
+                RoleArn: !GetAtt [CFNRole, Arn]
+                TemplatePath: BuildArtifact::sample-transformed.yaml
+                TemplateConfiguration: BuildArtifact::sample-configuration-test.json
+            - Name: DeployChangeSet
+              RunOrder: 2
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: CAPABILITY_IAM
+                ChangeSetName: !Sub ${AppName}-change-set-${Branch}
+                StackName:
+                  !If
+                    - IsProdStage
+                    - !Sub ${AppName}-test
+                    - !Sub ${AppName}-test-${Branch}
+                RoleArn: !GetAtt [CFNRole, Arn]
+            - Name: SmokeTest
+              RunOrder: 4
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref SmokeTestTestProject
+        - !If
+          - IsProdStage
+          - Name: DeployToQa
+            Actions:
+              - Name: CreateChangeSetQa1
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: BuildArtifact
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName:
+                     !Sub ${AppName}-qa1
+                  TemplatePath: BuildArtifact::sample-transformed.yaml
+                  TemplateConfiguration: BuildArtifact::sample-configuration-qa1.json
+              - Name: CreateChangeSetQa2
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: BuildArtifact
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName:
+                     !Sub ${AppName}-qa2
+                  TemplatePath: BuildArtifact::sample-transformed.yaml
+                  TemplateConfiguration: BuildArtifact::sample-configuration-qa2.json
+              - Name: ApprovalQa1
+                RunOrder: 2
+                ActionTypeId:
+                  Category: Approval
+                  Provider: Manual
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  NotificationArn: !Ref CodePipelineSNSTopic
+              - Name: ApprovalQa2
+                RunOrder: 2
+                ActionTypeId:
+                  Category: Approval
+                  Provider: Manual
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  NotificationArn: !Ref CodePipelineSNSTopic
+              - Name: DeployChangeSetQa1
+                RunOrder: 3
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName: !Sub ${AppName}-qa1
+              - Name: DeployChangeSetQa2
+                RunOrder: 3
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName: !Sub ${AppName}-qa2
+              - Name: SmokeTestQa1
+                RunOrder: 5
+                InputArtifacts:
+                  - Name: SourceOutput
+                ActionTypeId:
+                  Category: Build
+                  Provider: CodeBuild
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref SmokeTestQa1Project
+              - Name: SmokeTestQa2
+                RunOrder: 5
+                InputArtifacts:
+                  - Name: SourceOutput
+                ActionTypeId:
+                  Category: Build
+                  Provider: CodeBuild
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref SmokeTestQa2Project
+          - !Ref AWS::NoValue
+        - !If
+          - IsProdStage
+          - Name: DeployToProd
+            Actions:
+              - Name: CreateChangeSet
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: BuildArtifact
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName:
+                     !Sub ${AppName}-prod
+                  TemplatePath: BuildArtifact::sample-transformed.yaml
+                  TemplateConfiguration: BuildArtifact::sample-configuration-prod.json
+              - Name: Approval
+                RunOrder: 2
+                ActionTypeId:
+                  Category: Approval
+                  Provider: Manual
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  NotificationArn: !Ref CodePipelineSNSTopic
+              - Name: DeployChangeSet
+                RunOrder: 3
+                ActionTypeId:
+                  Category: Deploy
+                  Provider: CloudFormation
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ChangeSetName: !Sub ${AppName}-change-set
+                  RoleArn: !GetAtt [CFNRole, Arn]
+                  StackName: !Sub ${AppName}-prod
+              - Name: SmokeTest
+                RunOrder: 5
+                InputArtifacts:
+                  - Name: SourceOutput
+                ActionTypeId:
+                  Category: Build
+                  Provider: CodeBuild
+                  Owner: AWS
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref SmokeTestProdProject
+          - !Ref AWS::NoValue
+
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: '*'
+                Effect: Allow
+                Resource: '*'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service:
+              - codepipeline.amazonaws.com
+              - codebuild.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeCommitPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - codecommit:GetBranch
+                - codecommit:GetCommit
+                - codecommit:UploadArchive
+                - codecommit:GetUploadArchiveStatus
+                - codecommit:CancelUploadArchive
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${AppName}
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - sns:Publish
+                  - lambda:Invoke*
+                  - Lambda:List*
+        - PolicyName: CodePipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - s3:*
+                - cloudformation:CreateStack
+                - cloudformation:DescribeStacks
+                - cloudformation:DeleteStack
+                - cloudformation:UpdateStack
+                - cloudformation:CreateChangeSet
+                - cloudformation:ExecuteChangeSet
+                - cloudformation:DeleteChangeSet
+                - cloudformation:DescribeChangeSet
+                - cloudformation:SetStackPolicy
+                - iam:PassRole
+                - sns:Publish
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - ecr:GetAuthorizationToken
+                Effect: Allow
+                Resource: '*'
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.build.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: SAM_BUCKET
+            Value: !Ref SamBucket
+          - Name: APP_NAME
+            Value: !Ref AppName
+      ServiceRole: !Ref PipelineRole
+
+  SmokeTestDevProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.smoketest.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value:
+              !If
+                - IsProdStage
+                - !Sub ${AppName}-dev
+                - !Sub ${AppName}-dev-${Branch}
+          - Name: ROLE_ARN
+            Type: PLAINTEXT
+            Value: !GetAtt [PipelineRole, Arn]
+      ServiceRole: !Ref PipelineRole
+
+  SmokeTestTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.smoketest.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value:
+              !If
+                - IsProdStage
+                - !Sub ${AppName}-test
+                - !Sub ${AppName}-test-${Branch}
+          - Name: ROLE_ARN
+            Type: PLAINTEXT
+            Value: !GetAtt [PipelineRole, Arn]
+      ServiceRole: !Ref PipelineRole
+
+  SmokeTestQa1Project:
+    Condition: IsProdStage
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.smoketest.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value: !Sub ${AppName}-qa1
+          - Name: ROLE_ARN
+            Type: PLAINTEXT
+            Value: !GetAtt [PipelineRole, Arn]
+      ServiceRole: !Ref PipelineRole
+
+  SmokeTestQa2Project:
+    Condition: IsProdStage
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.smoketest.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value: !Sub ${AppName}-qa2
+          - Name: ROLE_ARN
+            Type: PLAINTEXT
+            Value: !GetAtt [PipelineRole, Arn]
+      ServiceRole: !Ref PipelineRole
+
+  SmokeTestProdProject:
+    Condition: IsProdStage
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: src/buildspec.smoketest.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImageName
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Type: PLAINTEXT
+            Value: !Sub ${AppName}-prod
+          - Name: ROLE_ARN
+            Type: PLAINTEXT
+            Value: !GetAtt [PipelineRole, Arn]
+      ServiceRole: !Ref PipelineRole
+
+Outputs:
+
+  PipelineNotificationTopic:
+    Condition: IsProdStage
+    Description: Notification SNS ARN for shared pipeline notificiations
+    Value: !Ref CodePipelineSNSTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-PipelineNotificationTopic
+  PipelineNotificationTopicName:
+    Condition: IsProdStage
+    Description: Repo activity notifications topic name
+    Value: !GetAtt CodePipelineSNSTopic.TopicName
+    Export:
+      Name: !Sub ${AWS::StackName}-PipelineNotificationTopicName
+  RepoCloneUrlHttp:
+    Description: URL for HTTP cloning
+    Value: !GetAtt Repository.CloneUrlHttp
+  RepoCloneUrlSsh:
+    Description: URL for SSH cloning
+    Value: !GetAtt Repository.CloneUrlSsh
+  RepoSshConfigHost:
+    Description: URL for SSH cloning
+    Value: !Sub git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${Repository.Name}
+  RepoName:
+    Description: Name of the repo
+    Value: !GetAtt Repository.Name
